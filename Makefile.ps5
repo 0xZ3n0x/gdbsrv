@@ -23,10 +23,11 @@ else
     $(error PS5_PAYLOAD_SDK is undefined)
 endif
 
-BIN   := gdbsrv-ps5.elf
+BUILD := build
+BIN   := $(BUILD)/gdbsrv-ps5.elf
 SRCS := src/gdb_serve.c src/gdb_resp.c src/gdb_sig.c src/gdb_pkt.c
 SRCS += src/ps5/main.c src/ps5/gdb_arch.c src/ps5/pt.c src/ps5/elfldr.c
-SRCS += src/gdb_symelf.c src/nidtab.c
+SRCS += src/gdb_symelf.c $(BUILD)/nidtab.c
 
 VERSION_TAG := $(shell git describe --abbrev=6 --dirty --always --tags)
 CFLAGS := -Isrc -Wall -DVERSION_TAG=\"$(VERSION_TAG)\" # -DGDB_PKT_TRACE
@@ -34,14 +35,17 @@ CFLAGS := -Isrc -Wall -DVERSION_TAG=\"$(VERSION_TAG)\" # -DGDB_PKT_TRACE
 all: $(BIN)
 
 clean:
-	rm -rf $(BIN) src/nidtab.c
+	rm -rf $(BUILD)
 
-$(BIN): $(SRCS)
-	$(CC) $(CFLAGS) -o $@ $^
+$(BIN): $(SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(SRCS)
 
 # NID -> symbol name table, derived from the SDK stub libraries.
-src/nidtab.c: tools/gen_nidtab.py
+$(BUILD)/nidtab.c: tools/gen_nidtab.py | $(BUILD)
 	python3 tools/gen_nidtab.py -s $(PS5_PAYLOAD_SDK) -o $@
+
+$(BUILD):
+	mkdir -p $@
 
 test: $(BIN)
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^

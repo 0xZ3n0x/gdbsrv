@@ -41,7 +41,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: Payload
-        path: gdbsrv-ps5.elf
+        path: build/gdbsrv-ps5.elf
         if-no-files-found: error
 
   release:
@@ -63,4 +63,4 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           prerelease: true
-          files: gdbsrv-ps5.elf
+          files: build/gdbsrv-ps5.elf

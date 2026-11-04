@@ -2,4 +2,4 @@
 *.elf
 .gdb_history
 
-/src/nidtab.c
+/build/
