@@ -24,15 +24,25 @@ along with this program; see the file COPYING. If not, see
 #include <unistd.h>
 #include <poll.h>
 
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #include "gdb_arch.h"
 #include "gdb_pkt.h"
 #include "gdb_resp.h"
 #include "gdb_sig.h"
+#include "gdb_symelf.h"
 
 
 #define STR_START_WITH(str, prefix) (!memcmp(str, prefix, strlen(prefix)))
+
+
+// Shared libraries are reported to gdb under this virtual directory; opening
+// a file there through vFile:open yields a symbol file synthesized on the
+// target, so gdb (with its default 'target:' sysroot) needs no local copies.
+#define GDB_VFILE_PREFIX  "/__gdbsrv__/"
+#define GDB_VFILE_MAX     16
+#define GDB_VFILE_FD_BASE 0x40000000
 
 
 /**
@@ -47,6 +57,12 @@ typedef struct gdb_session {
   int code;
   intptr_t baseaddr;
   char runfile[PATH_MAX];
+  char* libxml;       // cached qXfer:libraries:read document
+  size_t libxml_len;
+  struct {
+    char* buf;
+    size_t len;
+  } vfiles[GDB_VFILE_MAX]; // symbol files synthesized for vFile:open
 } gdb_session_t;
 
 
@@ -190,7 +206,112 @@ gdb_halt_inferior(gdb_session_t* sess) {
     sess->stdio = -1;
   }
 
+  free(sess->libxml);
+  sess->libxml = 0;
+  sess->libxml_len = 0;
+
+  for(int i=0; i<GDB_VFILE_MAX; i++) {
+    free(sess->vfiles[i].buf);
+    sess->vfiles[i].buf = 0;
+    sess->vfiles[i].len = 0;
+  }
+
   sess->attached = 0;
+}
+
+
+/**
+ * Return the index of the virtual file behind a vFile descriptor, or -1 if
+ * *fd* is a regular file descriptor.
+ **/
+static int
+gdb_vfile_index(gdb_session_t* sess, unsigned int fd) {
+  unsigned int idx = fd - GDB_VFILE_FD_BASE;
+
+  if(fd < GDB_VFILE_FD_BASE || idx >= GDB_VFILE_MAX ||
+     !sess->vfiles[idx].buf) {
+    return -1;
+  }
+
+  return (int)idx;
+}
+
+
+/**
+ * Synthesize the symbol file of the library named by a virtual path
+ * '/__gdbsrv__/<handle>/<name>'. Returns a vFile descriptor, or -1.
+ **/
+static int
+gdb_vfile_open(gdb_session_t* sess, const char* path) {
+  const size_t max = 256;
+  unsigned int handle;
+  gdb_lib_t* libs;
+  gdb_lib_t* lib = 0;
+  gdb_sym_t* syms = 0;
+  char* buf;
+  size_t len;
+  int idx, n, nsyms;
+
+  if(sscanf(path + strlen(GDB_VFILE_PREFIX), "%x/", &handle) != 1) {
+    errno = ENOENT;
+    return -1;
+  }
+  if(sess->pid <= 0) {
+    errno = ESRCH;
+    return -1;
+  }
+
+  for(idx=0; idx<GDB_VFILE_MAX; idx++) {
+    if(!sess->vfiles[idx].buf) {
+      break;
+    }
+  }
+  if(idx >= GDB_VFILE_MAX) {
+    errno = EMFILE;
+    return -1;
+  }
+
+  if(!(libs=calloc(max, sizeof(gdb_lib_t)))) {
+    errno = ENOMEM;
+    return -1;
+  }
+  if((n=gdb_getlibs(sess->pid, libs, max)) < 0) {
+    free(libs);
+    return -1;
+  }
+  for(int i=0; i<n; i++) {
+    if(libs[i].handle == handle) {
+      lib = &libs[i];
+      break;
+    }
+  }
+  if(!lib) {
+    free(libs);
+    errno = ENOENT;
+    return -1;
+  }
+
+  // A library without a readable symbol table still gets a (symbol-less)
+  // file, so gdb knows its sections.
+  if((nsyms=gdb_getlibsyms(sess->pid, handle, &syms)) < 0) {
+    fprintf(stderr, "gdb_getlibsyms(%s): %s\n", lib->name, strerror(errno));
+    nsyms = 0;
+  }
+
+  if(gdb_symelf_build(lib, syms, (size_t)nsyms, &buf, &len)) {
+    free(syms);
+    free(libs);
+    errno = ENOMEM;
+    return -1;
+  }
+
+  free(syms);
+  free(libs);
+
+  sess->vfiles[idx].buf = buf;
+  sess->vfiles[idx].len = len;
+
+  return GDB_VFILE_FD_BASE + idx;
 }
 
 
@@ -857,8 +978,110 @@ gdb_response_supported(gdb_session_t* sess, const char* data, size_t size) {
 
   sprintf(s, "PacketSize=%x", GDB_PKT_MAX_SIZE);
   strcat(s, ";qXfer:features:read+");
+  strcat(s, ";qXfer:libraries:read+");
 
   return gdb_pkt_puts(sess->fd, s);
+}
+
+
+static int
+gdb_build_libxml(gdb_session_t* sess) {
+  const size_t max = 256;
+  gdb_lib_t* libs;
+  size_t cap, len = 0;
+  char* xml;
+  int n;
+
+  free(sess->libxml);
+  sess->libxml = 0;
+  sess->libxml_len = 0;
+
+  if(!(libs=calloc(max, sizeof(gdb_lib_t)))) {
+    return -1;
+  }
+
+  if(sess->pid <= 0 || (n=gdb_getlibs(sess->pid, libs, max)) < 0) {
+    n = 0;
+  }
+
+  cap = 64 + (size_t)n * (sizeof(libs[0].name) + 64);
+  if(!(xml=malloc(cap))) {
+    free(libs);
+    return -1;
+  }
+
+  len += snprintf(xml + len, cap - len, "<library-list>");
+  for(int i=0; i<n; i++) {
+    // Library names are plain basenames; skip anything that would need
+    // XML escaping rather than emitting a malformed document.
+    if(strpbrk(libs[i].name, "<>&\"'")) {
+      continue;
+    }
+    len += snprintf(xml + len, cap - len,
+		    "<library name=\"" GDB_VFILE_PREFIX "%x/%s\">"
+		    "<segment address=\"0x%lx\"/></library>",
+		    libs[i].handle, libs[i].name, (unsigned long)libs[i].addr);
+  }
+  len += snprintf(xml + len, cap - len, "</library-list>");
+
+  free(libs);
+  sess->libxml = xml;
+  sess->libxml_len = len;
+
+  return 0;
+}
+
+
+/**
+ * Input pattern: 'qXfer:libraries:read::offset,length'
+ *
+ * Report the shared libraries loaded by the interior. Each library is named
+ * by a virtual path under GDB_VFILE_PREFIX, which gdb then reads through
+ * vFile:open to get the symbol file synthesized on the target.
+ **/
+static int
+gdb_response_libraries(gdb_session_t* sess, const char* data, size_t size) {
+  unsigned long off, len;
+  size_t remain;
+  char* buf;
+  int r;
+
+  if(sscanf(data, "qXfer:libraries:read::%lx,%lx", &off, &len) != 2) {
+    return gdb_pkt_puts(sess->fd, "E00");
+  }
+
+  // Rebuild the document when gdb starts reading it from the beginning,
+  // and serve subsequent chunks from the cache so they stay consistent.
+  if(!off || !sess->libxml) {
+    if(gdb_build_libxml(sess)) {
+      return gdb_pkt_puts(sess->fd, "E0C");
+    }
+  }
+
+  if(off >= sess->libxml_len) {
+    return gdb_pkt_puts(sess->fd, "l");
+  }
+
+  // Leave room for the 'm'/'l' prefix and possible escaping on the wire.
+  if(len > (GDB_PKT_MAX_SIZE / 2) - 1) {
+    len = (GDB_PKT_MAX_SIZE / 2) - 1;
+  }
+
+  remain = sess->libxml_len - off;
+  if(remain > len) {
+    remain = len;
+  }
+
+  if(!(buf=malloc(remain + 1))) {
+    return gdb_pkt_puts(sess->fd, "E0C");
+  }
+
+  buf[0] = (off + remain < sess->libxml_len) ? 'm' : 'l';
+  memcpy(buf + 1, sess->libxml + off, remain);
+  r = gdb_pkt_put(sess->fd, buf, remain + 1);
+  free(buf);
+
+  return r;
 }
 
 
@@ -876,6 +1099,9 @@ static int
 gdb_response_transfer(gdb_session_t* sess, const char* data, size_t size) {
   if(STR_START_WITH(data, "qXfer:features:read:target.xml:")) {
     return gdb_pkt_printf(sess->fd, "l%s", target_xml);
+  }
+  if(STR_START_WITH(data, "qXfer:libraries:read:")) {
+    return gdb_response_libraries(sess, data, size);
   }
 
   return gdb_pkt_printf(sess->fd, "");
@@ -1035,6 +1261,13 @@ gdb_response_fsopen(gdb_session_t* sess, const char* data, size_t size) {
     return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
   }
 
+  if(STR_START_WITH(filename, GDB_VFILE_PREFIX)) {
+    if((fd=gdb_vfile_open(sess, filename)) < 0) {
+      return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)errno);
+    }
+    return gdb_pkt_printf(sess->fd, "F%x", (unsigned int)fd);
+  }
+
   // The protocol defines portable open flag values (O_CREAT=0x200,
   // O_TRUNC=0x400, ...); these are identical to the BSD ones used by
   // the PS4/PS5 firmware, so no translation is required here.
@@ -1056,8 +1289,17 @@ static int
 gdb_response_fsclose(gdb_session_t* sess, const char* data, size_t size) {
   unsigned int fd;
 
+  int idx;
+
   if(sscanf(data, "vFile:close:%x", &fd) != 1) {
     return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
+  }
+
+  if((idx=gdb_vfile_index(sess, fd)) >= 0) {
+    free(sess->vfiles[idx].buf);
+    sess->vfiles[idx].buf = 0;
+    sess->vfiles[idx].len = 0;
+    return gdb_pkt_puts(sess->fd, "F0");
   }
 
   if(close((int)fd)) {
@@ -1144,6 +1386,7 @@ gdb_response_fsread(gdb_session_t* sess, const char* data, size_t size) {
   size_t total;
   char* buf;
   char* out;
+  int idx;
   int r;
 
   if(sscanf(data, "vFile:pread:%x,%x,%lx", &fd, &count, &off) != 3) {
@@ -1161,7 +1404,15 @@ gdb_response_fsread(gdb_session_t* sess, const char* data, size_t size) {
     return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)ENOMEM);
   }
 
-  if((len=pread((int)fd, buf, count, (off_t)off)) < 0) {
+  if((idx=gdb_vfile_index(sess, fd)) >= 0) {
+    // Serve synthesized symbol files from memory.
+    size_t vlen = sess->vfiles[idx].len;
+    len = 0;
+    if(off < vlen) {
+      len = (ssize_t)((vlen - off) < count ? (vlen - off) : count);
+      memcpy(buf, sess->vfiles[idx].buf + off, len);
+    }
+  } else if((len=pread((int)fd, buf, count, (off_t)off)) < 0) {
     free(buf);
     return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)errno);
   }
@@ -1185,6 +1436,77 @@ gdb_response_fsread(gdb_session_t* sess, const char* data, size_t size) {
   free(out);
 
   return r;
+}
+
+
+static void
+gdb_put_be32(uint8_t* p, uint32_t v) {
+  p[0] = v >> 24;
+  p[1] = v >> 16;
+  p[2] = v >> 8;
+  p[3] = v;
+}
+
+
+static void
+gdb_put_be64(uint8_t* p, uint64_t v) {
+  gdb_put_be32(p, (uint32_t)(v >> 32));
+  gdb_put_be32(p + 4, (uint32_t)v);
+}
+
+
+/**
+ * Input pattern: 'vFile:fstat: fd'
+ *
+ * Get information about the open file corresponding to fd.
+ *
+ * Reply:
+ *   'F<size>;<struct stat>' - size of the attachment (0x40), followed by a
+ *                             binary 'struct stat' in gdb's fileio layout
+ *                             (all fields big-endian).
+ *   'F-1,<errno>'           - on failure.
+ **/
+static int
+gdb_response_fsfstat(gdb_session_t* sess, const char* data, size_t size) {
+  uint8_t st[0x40];
+  char out[4 + sizeof(st)];
+  struct stat sb;
+  unsigned int fd;
+  int idx;
+
+  if(sscanf(data, "vFile:fstat:%x", &fd) != 1) {
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
+  }
+
+  memset(&sb, 0, sizeof(sb));
+  if((idx=gdb_vfile_index(sess, fd)) >= 0) {
+    sb.st_mode = S_IFREG | 0444;
+    sb.st_nlink = 1;
+    sb.st_size = sess->vfiles[idx].len;
+    sb.st_blksize = 0x4000;
+  } else if(fstat((int)fd, &sb)) {
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)errno);
+  }
+
+  memset(st, 0, sizeof(st));
+  gdb_put_be32(st + 0x00, (uint32_t)sb.st_dev);
+  gdb_put_be32(st + 0x04, (uint32_t)sb.st_ino);
+  gdb_put_be32(st + 0x08, (uint32_t)sb.st_mode);
+  gdb_put_be32(st + 0x0c, (uint32_t)sb.st_nlink);
+  gdb_put_be32(st + 0x10, (uint32_t)sb.st_uid);
+  gdb_put_be32(st + 0x14, (uint32_t)sb.st_gid);
+  gdb_put_be32(st + 0x18, (uint32_t)sb.st_rdev);
+  gdb_put_be64(st + 0x1c, (uint64_t)sb.st_size);
+  gdb_put_be64(st + 0x24, (uint64_t)sb.st_blksize);
+  gdb_put_be64(st + 0x2c, (uint64_t)sb.st_blocks);
+  gdb_put_be32(st + 0x34, (uint32_t)sb.st_atime);
+  gdb_put_be32(st + 0x38, (uint32_t)sb.st_mtime);
+  gdb_put_be32(st + 0x3c, (uint32_t)sb.st_ctime);
+
+  memcpy(out, "F40;", 4);
+  memcpy(out + 4, st, sizeof(st));
+
+  return gdb_pkt_put(sess->fd, out, sizeof(out));
 }
 
 
@@ -1374,6 +1696,9 @@ gdb_response(void* ctx, const char* data, size_t size) {
     }
     if(STR_START_WITH(data, "vFile:pread")) {
       return gdb_response_fsread(sess, data, size);
+    }
+    if(STR_START_WITH(data, "vFile:fstat")) {
+      return gdb_response_fsfstat(sess, data, size);
     }
     if(STR_START_WITH(data, "vRun")) {
       return gdb_response_run(sess, data, size);

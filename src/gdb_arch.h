@@ -70,3 +70,58 @@ int gdb_copyin(pid_t pid, const void* buf, intptr_t addr, size_t len);
 int gdb_copyout(pid_t pid, intptr_t addr, void* buf, size_t len);
 
 pid_t gdb_spawn(char* argv[], int stdio, intptr_t* baseaddr);
+
+
+#define GDB_LIB_MAX_SEGS 4
+
+#define GDB_SEG_READ  1
+#define GDB_SEG_WRITE 2
+#define GDB_SEG_EXEC  4
+
+
+/**
+ * A loadable segment of a shared library.
+ **/
+typedef struct gdb_seg {
+  intptr_t addr;
+  size_t   size;
+  int      prot; // GDB_SEG_* flags
+} gdb_seg_t;
+
+
+/**
+ * A shared library loaded in the address space of the interior.
+ **/
+typedef struct gdb_lib {
+  char      name[256];
+  uint32_t  handle;
+  intptr_t  addr; // load address of the first segment
+  int       nsegs;
+  gdb_seg_t segs[GDB_LIB_MAX_SEGS];
+} gdb_lib_t;
+
+
+/**
+ * A symbol exported by a shared library. The name is the raw (NID) name
+ * truncated to 15 characters, and the value is an absolute address in the
+ * address space of the process.
+ **/
+typedef struct gdb_sym {
+  char     name[16];
+  uint64_t value;
+} gdb_sym_t;
+
+
+/**
+ * Enumerate the shared libraries loaded by a stopped process. Returns the
+ * number of entries written to *libs*, or -1 on error.
+ **/
+int gdb_getlibs(pid_t pid, gdb_lib_t* libs, size_t max);
+
+
+/**
+ * Read the symbol table of a shared library loaded by a process. On success,
+ * the number of symbols is returned and *syms* points to a malloc'd array the
+ * caller must free. Returns -1 on error.
+ **/
+int gdb_getlibsyms(pid_t pid, uint32_t handle, gdb_sym_t** syms);

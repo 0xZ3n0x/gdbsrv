@@ -27,10 +27,21 @@ the GDB server can be compiled using the following command:
 john@localhost:gdbsrv$ make -f Makefile.posix
 ```
 
+## Symbols for sony libraries
+gdbsrv reports the loaded sony libraries to gdb, and builds a symbol file for
+each of them on the target from the symbol table the kernel keeps for the
+library. NIDs are translated to names using a table generated from the
+payload SDK at build time. With gdb's default `sysroot` (`target:`) this works
+out of the box; no files are needed on the host:
+```
+(gdb) set osabi none
+(gdb) target extended-remote ps5:2159
+```
+Run `sharedlibrary` in gdb to pick up libraries loaded after startup.
+
 ## Known issues
-- Symbols from dynamic sony libraries are not loaded correctly at the moment.
-- A couble of arguments passed to the ELF are allocated on the heap, so gdb may
-  report errors when trying to resolve the arguments to _start()
+- Only NIDs whose names are known to the payload SDK are translated; other
+  library symbols show up under their NID.
 
 ## Reporting Bugs
 If you encounter problems with gdbsrv, please [file a github issue][issues].
