@@ -38,6 +38,7 @@ sys_ptrace(int request, pid_t pid, caddr_t addr, int data) {
   pid_t mypid = getpid();
   uint8_t caps[16];
   uint64_t authid;
+  int saved_errno;
   int ret;
 
   if(!(authid=kernel_get_ucred_authid(mypid))) {
@@ -51,17 +52,26 @@ sys_ptrace(int request, pid_t pid, caddr_t addr, int data) {
     return -1;
   }
   if(kernel_set_ucred_caps(mypid, privcaps)) {
+    // Restore the credentials partially set above before bailing out.
+    kernel_set_ucred_authid(mypid, authid);
     return -1;
   }
 
   ret = (int)__syscall(SYS_ptrace, request, pid, addr, data);
 
-  if(kernel_set_ucred_authid(mypid, authid)) {
+  // Preserve the ptrace() errno; the kernel_* calls clobber it.
+  saved_errno = errno;
+
+  // Always attempt both restores, but report a failure: silently keeping
+  // the elevated credentials would be worse than failing the request.
+  if(kernel_set_ucred_authid(mypid, authid) |
+     kernel_set_ucred_caps(mypid, caps)) {
+    fprintf(stderr, "sys_ptrace: unable to restore credentials\n");
+    errno = EPERM;
     return -1;
   }
-  if(kernel_set_ucred_caps(mypid, caps)) {
-    return -1;
-  }
+
+  errno = saved_errno;
 
   return ret;
 }

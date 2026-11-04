@@ -16,6 +16,7 @@ along with this program; see the file COPYING. If not, see
 
 #include <sys/types.h>
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <pthread.h>
@@ -140,12 +141,26 @@ gdb_serve(uint16_t port) {
   addr_len = sizeof(client_addr);
 
   while(1) {
+    addr_len = sizeof(client_addr);
+
     if((connfd=accept(srvfd, (struct sockaddr*)&client_addr, &addr_len)) < 0) {
+      if(EINTR == errno || ECONNABORTED == errno) {
+	continue;
+      }
+
       perror("accept");
       break;
     }
 
-    pthread_create(&trd, NULL, gdb_thread, (void*)(long)connfd);
+    if(pthread_create(&trd, NULL, gdb_thread, (void*)(long)connfd)) {
+      perror("pthread_create");
+      close(connfd);
+      continue;
+    }
+
+    // Sessions are self-contained; detach the thread so that it can
+    // release its resources once the client disconnects.
+    pthread_detach(trd);
   }
 
   return close(srvfd);

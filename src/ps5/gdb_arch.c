@@ -18,6 +18,9 @@ along with this program; see the file COPYING. If not, see
 #include <sys/syscall.h>
 #include <sys/wait.h>
 
+#include <errno.h>
+#include <stdio.h>
+
 #include <ps5/kernel.h>
 
 #include "gdb_arch.h"
@@ -32,6 +35,7 @@ sys_ptrace(int request, pid_t pid, caddr_t addr, int data) {
   pid_t mypid = getpid();
   uint8_t caps[16];
   uint64_t authid;
+  int saved_errno;
   int ret;
 
   if(!(authid=kernel_get_ucred_authid(mypid))) {
@@ -45,17 +49,26 @@ sys_ptrace(int request, pid_t pid, caddr_t addr, int data) {
     return -1;
   }
   if(kernel_set_ucred_caps(mypid, privcaps)) {
+    // Restore the credentials partially set above before bailing out.
+    kernel_set_ucred_authid(mypid, authid);
     return -1;
   }
 
   ret = (int)__syscall(SYS_ptrace, request, pid, addr, data);
 
-  if(kernel_set_ucred_authid(mypid, authid)) {
+  // Preserve the ptrace() errno; the kernel_* calls above will clobber it.
+  saved_errno = errno;
+
+  // Always attempt both restores, but report a failure: silently keeping
+  // the elevated credentials would be worse than failing the request.
+  if(kernel_set_ucred_authid(mypid, authid) |
+     kernel_set_ucred_caps(mypid, caps)) {
+    fprintf(stderr, "sys_ptrace: unable to restore credentials\n");
+    errno = EPERM;
     return -1;
   }
-  if(kernel_set_ucred_caps(mypid, caps)) {
-    return -1;
-  }
+
+  errno = saved_errno;
 
   return ret;
 }
@@ -93,7 +106,7 @@ gdb_step(int pid, intptr_t addr, int sig) {
     addr = 1;
   }
 
-  if(sys_ptrace(PT_STEP, pid, (caddr_t)addr, 0)) {
+  if(sys_ptrace(PT_STEP, pid, (caddr_t)addr, sig)) {
     return -1;
   }
 
@@ -123,7 +136,6 @@ gdb_getregs(pid_t pid, uint64_t gprmap[GDB_GPR_MAX]) {
     return -1;
   }
 
-  gprmap[GDB_GPR_RAX] = r.r_rax;
   gprmap[GDB_GPR_RAX] = r.r_rax;
   gprmap[GDB_GPR_RBX] = r.r_rbx;
   gprmap[GDB_GPR_RCX] = r.r_rcx;

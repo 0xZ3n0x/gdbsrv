@@ -53,8 +53,9 @@ gdb_putchar(int fd, char c) {
     switch(write(fd, &c, sizeof(c))) {
     case -1:
       if(EAGAIN != errno && EINTR != errno) return -1;
-    case 0:
       continue;
+    case 0:
+      return -1;
     default:
       return 0;
     }
@@ -73,8 +74,11 @@ gdb_getchar(int fd) {
     switch(read(fd, &c, sizeof(c))) {
     case -1:
       if(EAGAIN != errno && EINTR != errno) return -1;
-    case 0:
       continue;
+    case 0:
+      // EOF - the peer has closed the connection.
+      errno = ECONNRESET;
+      return -1;
     default:
       return (c & 0xff);
     }
@@ -102,14 +106,13 @@ gdb_pkt_sync(int fd) {
 }
 
 
-int
-gdb_pkt_put(int fd, const char* data, size_t size) {
+/**
+ * Emit a single $data#checksum sequence on the wire.
+ **/
+static int
+gdb_pkt_send(int fd, const char* data, size_t size) {
   uint8_t checksum = 0;
   int ch;
-
-#if GDB_PKT_TRACE
-  printf("rsp-out '%s'\n", data);
-#endif
 
   if(gdb_putchar(fd, '$')) {
     return -1;
@@ -141,20 +144,46 @@ gdb_pkt_put(int fd, const char* data, size_t size) {
     return -1;
   }
 
-  switch(gdb_getchar(fd)) {
-  case 3:
-    // Assume the client transmitted a Ctrl-c charcacter sequence
-    // while an interior is running.
-    errno = EINTR;
-    return -1;
+  return 0;
+}
 
-  case '+':
-    return 0;
 
-  default:
-    errno = EPROTO;
-    return -1;
+int
+gdb_pkt_put(int fd, const char* data, size_t size) {
+  int attempt;
+
+#if GDB_PKT_TRACE
+  printf("rsp-out '%.*s'\n", (int)size, data);
+#endif
+
+  // Retransmit the packet a few times if the client responds with a NACK
+  // ('-'), as mandated by the remote serial protocol.
+  for(attempt=0; attempt<5; attempt++) {
+    if(gdb_pkt_send(fd, data, size)) {
+      return -1;
+    }
+
+    switch(gdb_getchar(fd)) {
+    case 3:
+      // Assume the client transmitted a Ctrl-c charcacter sequence
+      // while an inferior is running.
+      errno = EINTR;
+      return -1;
+
+    case '+':
+      return 0;
+
+    case '-':
+      continue;
+
+    default:
+      errno = EPROTO;
+      return -1;
+    }
   }
+
+  errno = EPROTO;
+  return -1;
 }
 
 
@@ -209,7 +238,15 @@ gdb_pkt_printf(int fd, const char *fmt, ...) {
 
 int
 gdb_pkt_perror(int fd, const char *str) {
-  return gdb_pkt_printf(fd, "E.%s: %s", str, strerror(errno));
+  int saved_errno = errno;
+
+  // The 'E' reply only carries a two-digit hex error number. The textual
+  // message cannot be sent as an 'O' packet here: 'O' is only valid while
+  // gdb awaits a stop reply, and gdb would otherwise take it as the reply
+  // to the current command, desynchronizing the session. Log it locally.
+  fprintf(stderr, "%s: %s\n", str, strerror(saved_errno));
+
+  return gdb_pkt_printf(fd, "E%02X", (saved_errno & 0xff));
 }
 
 
@@ -227,64 +264,79 @@ int
 gdb_pkt_get(int fd, gdb_pkt_cb_t* cb, void* ctx) {
   uint8_t checksum = 0;
   uint8_t xmitcsum = 0;
-  off_t offset = 0;
-  size_t size = 0;
+  size_t offset = 0;
   char *buf = 0;
   int ch = 0;
-  void* p;
+  int nack = 0;
   int r;
 
-  if(gdb_pkt_sync(fd)) {
-    return -1;
-  }
-
-  if(!(buf=malloc(0x4000))) {
+  // One byte above the advertised PacketSize for the NUL terminator.
+  if(!(buf=malloc(GDB_PKT_MAX_SIZE + 1))) {
     return -1;
   }
 
   while(1) {
-    if((ch=gdb_getchar(fd)) == -1) {
+    if(gdb_pkt_sync(fd)) {
       free(buf);
       return -1;
     }
 
-    if('#' == ch) {
-      break;
-    }
+    checksum = 0;
+    offset = 0;
 
-    if(offset >= size) {
-      if(!(p=realloc(buf, offset+0x4000))) {
-        free(buf);
-        return -1;
+    while(1) {
+      if((ch=gdb_getchar(fd)) == -1) {
+	free(buf);
+	return -1;
       }
-      buf = p;
+
+      if('#' == ch) {
+	break;
+      }
+
+      if(offset >= GDB_PKT_MAX_SIZE) {
+	// Oversized packet (exceeds the advertised PacketSize): NACK it
+	// and drop the session; this indicates a protocol violation or a
+	// corrupt byte stream.
+	gdb_putchar(fd, '-');
+	free(buf);
+	return -1;
+      }
+
+      checksum += (uint8_t)ch;
+      buf[offset] = (char)ch;
+      offset += 1;
+    }
+    buf[offset] = 0;
+
+    if((ch=gdb_getchar(fd)) == -1) {
+      free(buf);
+      return -1;
+    }
+    xmitcsum = (uint8_t)(gdb_hex(ch) << 4);
+
+    if((ch=gdb_getchar(fd)) == -1) {
+      free(buf);
+      return -1;
+    }
+    xmitcsum += (uint8_t)gdb_hex(ch);
+
+    if(checksum != xmitcsum) {
+      // Ask the client to retransmit; give up after a few consecutive
+      // NACKs so a corrupt stream cannot hang the session.
+      gdb_putchar(fd, '-');
+      if(++nack >= 5) {
+	free(buf);
+	return -1;
+      }
+      continue;
     }
 
-    checksum += (uint8_t)ch;
-    buf[offset] = (char)ch;
-    offset += 1;
-  }
-  buf[offset] = 0;
-  if((ch=gdb_getchar(fd)) == -1) {
-    free(buf);
-    return 0;
-  }
-  xmitcsum = gdb_hex(ch) << 4;
-
-  if((ch=gdb_getchar(fd)) == -1) {
-    free(buf);
-    return 0;
-  }
-  xmitcsum += gdb_hex(ch);
-
-  if(checksum != xmitcsum) {
-    gdb_putchar(fd, '-');
-    free(buf);
-    return -1;
+    break;
   }
 
 #if GDB_PKT_TRACE
-  printf("rsp-in '%s'\n", buf);
+  printf("rsp-in '%.*s'\n", (int)offset, buf);
 #endif
 
   gdb_putchar(fd, '+');

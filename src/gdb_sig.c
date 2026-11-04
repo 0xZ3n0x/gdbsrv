@@ -57,6 +57,9 @@ int gdb_sig_toposix(int gdb_sig) {
   case GDB_SIGNAL_ILL:    return SIGILL;
   case GDB_SIGNAL_TRAP:   return SIGTRAP;
   case GDB_SIGNAL_ABRT:   return SIGABRT;
+#ifdef SIGEMT
+  case GDB_SIGNAL_EMT:    return SIGEMT;
+#endif
   case GDB_SIGNAL_FPE:    return SIGFPE;
   case GDB_SIGNAL_KILL:   return SIGKILL;
   case GDB_SIGNAL_BUS:    return SIGBUS;
@@ -78,6 +81,9 @@ int gdb_sig_toposix(int gdb_sig) {
   case GDB_SIGNAL_VTALRM: return SIGVTALRM;
   case GDB_SIGNAL_PROF:   return SIGPROF;
   case GDB_SIGNAL_WINCH:  return SIGWINCH;
+#ifdef SIGLOST
+  case GDB_SIGNAL_LOST:   return SIGLOST;
+#endif
   case GDB_SIGNAL_USR1:   return SIGUSR1;
   case GDB_SIGNAL_USR2:   return SIGUSR2;
   default:                return 0;
@@ -93,6 +99,9 @@ int gdb_sig_fromposix(int posix_sig) {
   case SIGILL:    return GDB_SIGNAL_ILL;
   case SIGTRAP:   return GDB_SIGNAL_TRAP;
   case SIGABRT:   return GDB_SIGNAL_ABRT;
+#ifdef SIGEMT
+  case SIGEMT:    return GDB_SIGNAL_EMT;
+#endif
   case SIGFPE:    return GDB_SIGNAL_FPE;
   case SIGKILL:   return GDB_SIGNAL_KILL;
   case SIGBUS:    return GDB_SIGNAL_BUS;
@@ -114,6 +123,9 @@ int gdb_sig_fromposix(int posix_sig) {
   case SIGVTALRM: return GDB_SIGNAL_VTALRM;
   case SIGPROF:   return GDB_SIGNAL_PROF;
   case SIGWINCH:  return GDB_SIGNAL_WINCH;
+#ifdef SIGLOST
+  case SIGLOST:   return GDB_SIGNAL_LOST;
+#endif
   case SIGUSR1:   return GDB_SIGNAL_USR1;
   case SIGUSR2:   return GDB_SIGNAL_USR2;
   default:        return 0;

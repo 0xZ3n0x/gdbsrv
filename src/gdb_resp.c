@@ -43,7 +43,10 @@ typedef struct gdb_session {
   int fd;
   int sig;
   int stdio;
+  int attached;
+  int code;
   intptr_t baseaddr;
+  char runfile[PATH_MAX];
 } gdb_session_t;
 
 
@@ -66,11 +69,15 @@ gdb_bin_unescape(char *data, int len) {
   char *w = data;
   char *r = data;
 
-  while(r-data < len) {
+  while(r - data < len) {
     char v = *r++;
     if(v != '}') {
       *w++ = v;
       continue;
+    }
+    if(r - data >= len) {
+      // Dangling escape character at the end of the buffer; drop it.
+      break;
     }
     *w++ = *r++ ^ 0x20;
   }
@@ -88,7 +95,7 @@ gdb_hex2bin(const char* str, void* bin, size_t size) {
   uint8_t* ptr = bin;
   int ch;
 
-  if(len > size*2 || len%2) {
+  if((size_t)len > size*2 || len%2) {
     return -1;
   }
 
@@ -105,8 +112,94 @@ gdb_hex2bin(const char* str, void* bin, size_t size) {
 
 
 /**
+ * Parse the address and signal arguments of the [cCsS] packets.
+ **/
+static void
+gdb_parse_stepcont(const char* data, intptr_t* addr, int* sig) {
+  const char* semi;
+  unsigned long a = 0;
+  unsigned int s = 0;
+
+  *addr = 0;
+  *sig = 0;
+
+  switch(data[0]) {
+  case 'c':
+  case 's':
+    // 'c [addr]' / 's [addr]'
+    sscanf(data + 1, "%lx", &a);
+    *addr = (intptr_t)a;
+    break;
+
+  case 'C':
+  case 'S':
+    // 'C sig[;addr]' / 'S sig[;addr]'
+    if(sscanf(data + 1, "%2x", &s) == 1) {
+      *sig = (int)s;
+    }
+    if((semi = strchr(data + 1, ';'))) {
+      sscanf(semi + 1, "%lx", &a);
+      *addr = (intptr_t)a;
+    }
+    break;
+  }
+}
+
+
+/**
+ * Forward whatever the interior has left in its stdout pipe.
+ **/
+static void
+gdb_drain_stdio(gdb_session_t* sess) {
+  char buf[0x100];
+  ssize_t len;
+
+  if(sess->stdio <= 0) {
+    return;
+  }
+
+  for(int i=0; i<64; i++) {
+    if((len=read(sess->stdio, buf, sizeof(buf))) <= 0) {
+      break;
+    }
+    if(gdb_pkt_notify(sess->fd, buf, len)) {
+      break;
+    }
+  }
+}
+
+
+/**
+ * Release the interior: detached processes are resumed, processes that
+ * were spawned through vRun are killed and reaped.
+ **/
+static void
+gdb_halt_inferior(gdb_session_t* sess) {
+  if(sess->pid > 0) {
+    if(sess->attached) {
+      gdb_detach(sess->pid, SIGCONT);
+    } else {
+      gdb_detach(sess->pid, SIGKILL);
+      waitpid(sess->pid, 0, 0);
+    }
+    sess->pid = -1;
+  }
+
+  if(sess->stdio > 0) {
+    close(sess->stdio);
+    sess->stdio = -1;
+  }
+
+  sess->attached = 0;
+}
+
+
+/**
  * Flush stdout of the interior to the connecting client,
  * and look for Ctrl-c sequence from the client.
+ *
+ * Returns 0 to keep waiting, a signal number to deliver to the interior,
+ * or -1 if the client connection is gone.
  **/
 static int
 gdb_response_stdio(gdb_session_t* sess) {
@@ -129,6 +222,9 @@ gdb_response_stdio(gdb_session_t* sess) {
 
   switch(poll(fds, cnt, 1)) {
   case -1:
+    if(EINTR == errno) {
+      return 0;
+    }
     if(gdb_pkt_notify_perror(sess->fd, "poll")) {
       perror("gdb_pkt_notify_perror");
     }
@@ -138,10 +234,18 @@ gdb_response_stdio(gdb_session_t* sess) {
     return 0;
 
   default:
-    if(fds[0].revents & POLLIN) {
+    if(fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
       if((len=read(sess->fd, buf, 1)) < 0) {
+	if(EAGAIN == errno || EINTR == errno) {
+	  return 0;
+	}
 	perror("read");
-	return SIGSTOP;
+	return -1;
+      }
+
+      if(len == 0) {
+	// The client has closed the connection.
+	return -1;
       }
 
       if(buf[0] == 3) {
@@ -149,21 +253,26 @@ gdb_response_stdio(gdb_session_t* sess) {
       }
     }
 
-    if(fds[1].revents & POLLIN) {
-      if((len=read(sess->stdio, buf, sizeof(buf))) < 0) {
-	if(gdb_pkt_notify_perror(sess->fd, "read")) {
-	  perror("gdb_pkt_notify_perror");
+    if(cnt > 1 && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+      if((len=read(sess->stdio, buf, sizeof(buf))) <= 0) {
+	// EOF or error on the stdout pipe of the interior; stop polling it
+	// so we do not spin on a hung-up descriptor.
+	if(len < 0) {
+	  perror("read");
 	}
-	return SIGSTOP;
+	close(sess->stdio);
+	sess->stdio = -1;
+	return 0;
       }
 
       if(gdb_pkt_notify(sess->fd, buf, len) < 0) {
 	if(errno == EINTR) {
+	  // Ctrl-c received while waiting for the ack.
 	  return SIGSTOP;
 	}
 
 	perror("gdb_pkt_notify");
-	return SIGSTOP;
+	return -1;
       }
     }
   }
@@ -187,18 +296,28 @@ gdb_waitpid(gdb_session_t* sess, char* data, size_t size) {
     }
 
     if(!res) {
-      if((res=gdb_response_stdio(sess))) {
+      if((res=gdb_response_stdio(sess)) < 0) {
+	// Client is gone; let the caller tear the session down.
+	errno = ECONNRESET;
+	return -1;
+      }
+      if(res) {
 	kill(sess->pid, res);
       }
       continue;
     }
 
     if(WIFEXITED(status)) {
-      snprintf(data, size, "W%02x", WEXITSTATUS(status));
+      gdb_drain_stdio(sess);
+      sess->code = WEXITSTATUS(status);
+      sess->pid = -1;
+      snprintf(data, size, "W%02x", sess->code);
       return 0;
 
     } else if(WIFSIGNALED(status)) {
+      gdb_drain_stdio(sess);
       sess->sig = WTERMSIG(status);
+      sess->pid = -1;
       snprintf(data, size, "X%02x", gdb_sig_fromposix(sess->sig));
       return 0;
 
@@ -241,13 +360,11 @@ gdb_response_extended_mode(gdb_session_t* sess, const char* data, size_t size) {
  **/
 static int
 gdb_response_getsig(gdb_session_t* sess, const char* data, size_t size) {
-  int exit_code = 0;
-
   if(sess->pid > 0) {
     return gdb_pkt_printf(sess->fd, "S%02X", gdb_sig_fromposix(sess->sig));
-  } else {
-    return gdb_pkt_printf(sess->fd, "W%02X", exit_code);
   }
+
+  return gdb_pkt_printf(sess->fd, "W%02X", sess->code);
 }
 
 
@@ -280,13 +397,14 @@ gdb_response_continue(gdb_session_t* sess, const char* data, size_t size) {
   char buf[32];
   int sig = 0;
 
-  if(sscanf(data, "S%x;%lx", &sig, &addr) != 2) {
-    if(sscanf(data, "S%x", &sig) != 1) {
-      sscanf(data, "s%lx", &addr);
-    }
-  }
-
+  gdb_parse_stepcont(data, &addr, &sig);
   sig = gdb_sig_toposix(sig);
+
+  // Never re-inject the signals that typically cause a stop; resume
+  // without a signal instead.
+  if(SIGSTOP == sig || SIGTRAP == sig) {
+    sig = 0;
+  }
 
   if(gdb_continue(sess->pid, addr, sig)) {
     return gdb_pkt_perror(sess->fd, "gdb_continue");
@@ -312,23 +430,28 @@ gdb_response_continue(gdb_session_t* sess, const char* data, size_t size) {
  * specific process. The pid is specified as a big-endian hex string.
  *
  * Reply:
-    ‘OK’ for success
+     ‘OK’ for success
  **/
 static int
 gdb_response_detach(gdb_session_t* sess, const char* data, size_t size) {
+  unsigned int upid;
   pid_t pid = sess->pid;
 
-  if(sscanf(data, "D;%x", &pid) != 2){
-    if(strcmp(data, "D")){
-      return -1;
+  if(sscanf(data, "D;%x", &upid) == 1) {
+    // Detaching a specific process; we only manage a single one.
+    if((pid_t)upid != pid) {
+      return gdb_pkt_puts(sess->fd, "");
     }
+  } else if(strcmp(data, "D")) {
+    return gdb_pkt_puts(sess->fd, "");
   }
 
-  if(gdb_detach(pid, SIGCONT)) {
+  if(pid > 0 && gdb_detach(pid, SIGCONT)) {
     return gdb_pkt_perror(sess->fd, "gdb_detach");
   }
 
   sess->pid = -1;
+  sess->attached = 0;
 
   return gdb_pkt_puts(sess->fd, "OK");
 }
@@ -370,22 +493,22 @@ static int
 gdb_response_getregs(gdb_session_t* sess, const char* data, size_t size) {
   uint64_t gprmap[GDB_GPR_MAX];
   char buf[(GDB_GPR_MAX*16)+1];
-  char hex[16+1];
+  char* p = buf;
 
   if(gdb_getregs(sess->pid, gprmap)) {
     return gdb_pkt_perror(sess->fd, "gdb_getregs");
   }
 
-  buf[0] = 0;
   for(int i=GDB_GPR_RAX; i<=GDB_GPR_RIP; i++) {
-    sprintf(hex, "%016lx", __builtin_bswap64(gprmap[i]));
-    strcat(buf, hex);
+    sprintf(p, "%016lx", __builtin_bswap64(gprmap[i]));
+    p += 16;
   }
 
   for(int i=GDB_GPR_EFLAGS; i<=GDB_GPR_GS; i++) {
-    sprintf(hex, "%08x", __builtin_bswap32(gprmap[i]));
-    strcat(buf, hex);
+    sprintf(p, "%08x", __builtin_bswap32(gprmap[i]));
+    p += 8;
   }
+  *p = 0;
 
   return gdb_pkt_puts(sess->fd, buf);
 }
@@ -398,17 +521,23 @@ gdb_response_getregs(gdb_session_t* sess, const char* data, size_t size) {
  * the XX... data.
  *
  * Reply:
- *   ‘OK’ for success
+ *   'OK' for success
  **/
 static int
 gdb_response_setregs(gdb_session_t* sess, const char* data, size_t size) {
   uint64_t gprmap[GDB_GPR_MAX];
+  size_t required = ((GDB_GPR_RIP + 1) * 16) +
+    ((GDB_GPR_GS - GDB_GPR_EFLAGS + 1) * 8);
 
   data++;
+  if(strlen(data) < required) {
+    return gdb_pkt_puts(sess->fd, "");
+  }
+
   for(int i=GDB_GPR_RAX; i<=GDB_GPR_RIP; i++) {
     long val;
     if(sscanf(data, "%016lx", &val) != 1) {
-      return -1;
+      return gdb_pkt_puts(sess->fd, "");
     }
     data += 16;
     gprmap[i] = __builtin_bswap64(val);
@@ -417,7 +546,7 @@ gdb_response_setregs(gdb_session_t* sess, const char* data, size_t size) {
   for(int i=GDB_GPR_EFLAGS; i<=GDB_GPR_GS; i++) {
     int val;
     if(sscanf(data, "%08x", &val) != 1) {
-      return -1;
+      return gdb_pkt_puts(sess->fd, "");
     }
     data += 8;
     gprmap[i] = __builtin_bswap32(val);
@@ -457,14 +586,10 @@ gdb_response_setregs(gdb_session_t* sess, const char* data, size_t size) {
  **/
 static int
 gdb_response_kill(gdb_session_t* sess, const char* data, size_t size) {
-  if(sess->pid < 0) {
-    return gdb_pkt_puts(sess->fd, "");
-  }
+  gdb_halt_inferior(sess);
 
-  if(gdb_detach(sess->pid, SIGKILL)) {
-    return gdb_pkt_perror(sess->fd, "gdb_detach");
-  }
-
+  // The 'k' packet has no reply; gdb will close the connection or probe
+  // the target state through the '?' packet.
   return 0;
 }
 
@@ -496,29 +621,28 @@ static int
 gdb_response_getmem(gdb_session_t* sess, const char* data, size_t size) {
   char dbuf[GDB_PKT_MAX_SIZE / 2];
   char sbuf[GDB_PKT_MAX_SIZE];
-  intptr_t addr;
-  char hex[17];
-  size_t len;
+  char* p = sbuf;
+  unsigned long addr;
+  unsigned long len;
 
-  if(sscanf(data, "m%lx,%lx:", &addr, &len) != 2) {
-    return -1;
+  if(sscanf(data, "m%lx,%lx", &addr, &len) != 2) {
+    return gdb_pkt_puts(sess->fd, "");
   }
 
-  if(sizeof(dbuf) <= len) {
-    return -1;
+  // gdb tolerates a short reply; clamp instead of rejecting.
+  if(len > (sizeof(dbuf) - 1)) {
+    len = sizeof(dbuf) - 1;
   }
 
-  if(gdb_copyout(sess->pid, addr, dbuf, len)) {
-    return gdb_pkt_printf(sess->fd, "E%02X", errno);
+  if(gdb_copyout(sess->pid, (intptr_t)addr, dbuf, len)) {
+    return gdb_pkt_printf(sess->fd, "E%02X", ((errno ? errno : EIO) & 0xff));
   }
 
-  sbuf[0] = 0;
-  for(size_t i=0; i<len; i+=8) {
-    long *word = (long*)&dbuf[i];
-    sprintf(hex, "%016lx", __builtin_bswap64(*word));
-    strcat(sbuf, hex);
+  for(size_t i=0; i<len; i++) {
+    sprintf(p, "%02x", (uint8_t)dbuf[i]);
+    p += 2;
   }
-  sbuf[len*2] = 0;
+  *p = 0;
 
   return gdb_pkt_puts(sess->fd, sbuf);
 }
@@ -532,33 +656,44 @@ gdb_response_getmem(gdb_session_t* sess, const char* data, size_t size) {
  * transmitted as a two-digit hexadecimal number.
  *
  * Reply:
-    'OK' - All the data was written successfully. (If only part of the
+     'OK' - All the data was written successfully. (If only part of the
            data was written, this command returns an error.)
  **/
 static int
 gdb_response_setmem(gdb_session_t* sess, const char* data, size_t size) {
-  intptr_t addr;
-  size_t len;
+  unsigned long addr;
+  unsigned long len;
+  const char* p;
   char* buf;
   int r;
 
   if(sscanf(data, "M%lx,%lx:", &addr, &len) != 2) {
-    return gdb_pkt_printf(sess->fd, "E00");
+    return gdb_pkt_printf(sess->fd, "E%02X", (EINVAL & 0xff));
   }
-  if(!(data=strstr(data, ":"))) {
-    return -1;
+
+  // The hex payload requires at least 2 characters per byte, and the
+  // whole packet is bounded by GDB_PKT_MAX_SIZE.
+  if(len == 0 || len > ((GDB_PKT_MAX_SIZE / 2) - 1)) {
+    return gdb_pkt_printf(sess->fd, "E%02X", (EINVAL & 0xff));
+  }
+
+  if(!(p=strchr(data, ':'))) {
+    return gdb_pkt_printf(sess->fd, "E%02X", (EINVAL & 0xff));
   }
 
   if(!(buf=malloc(len))) {
-    return -1;
-  }
-  if(gdb_hex2bin(data+1, buf, len)) {
-    free(buf);
-    return -1;
+    return gdb_pkt_printf(sess->fd, "E%02X", (ENOMEM & 0xff));
   }
 
-  if(gdb_copyin(sess->pid, buf, addr, len)) {
-    r = gdb_pkt_printf(sess->fd, "E%02X", errno);
+  // The payload must carry exactly two hex digits per byte; a short
+  // payload would otherwise be zero-padded and written to the interior.
+  if(strlen(p + 1) != len * 2 || gdb_hex2bin(p + 1, buf, len)) {
+    free(buf);
+    return gdb_pkt_printf(sess->fd, "E%02X", (EINVAL & 0xff));
+  }
+
+  if(gdb_copyin(sess->pid, buf, (intptr_t)addr, len)) {
+    r = gdb_pkt_printf(sess->fd, "E%02X", ((errno ? errno : EIO) & 0xff));
   } else {
     r = gdb_pkt_puts(sess->fd, "OK");
   }
@@ -580,21 +715,21 @@ gdb_response_setmem(gdb_session_t* sess, const char* data, size_t size) {
  **/
 static int
 gdb_response_getreg(gdb_session_t* sess, const char* data, size_t size) {
-  enum gdb_gpr reg;
+  unsigned int reg;
   uint64_t val;
 
-  if(sscanf(data, "p%x", &reg) != 1){
-    return -1;
+  if(sscanf(data, "p%x", &reg) != 1 || reg >= GDB_GPR_MAX) {
+    return gdb_pkt_puts(sess->fd, "");
   }
 
-  if(gdb_getreg(sess->pid, reg, &val)) {
+  if(gdb_getreg(sess->pid, (enum gdb_gpr)reg, &val)) {
     return gdb_pkt_perror(sess->fd, "gdb_getreg");
   }
 
   if(reg <= GDB_GPR_RIP) {
     return gdb_pkt_printf(sess->fd, "%016lx", __builtin_bswap64(val));
   } else {
-    return gdb_pkt_printf(sess->fd, "%08lx", __builtin_bswap32(val));
+    return gdb_pkt_printf(sess->fd, "%08x", __builtin_bswap32(val));
   }
 }
 
@@ -611,11 +746,17 @@ gdb_response_getreg(gdb_session_t* sess, const char* data, size_t size) {
  **/
 static int
 gdb_response_setreg(gdb_session_t* sess, const char* data, size_t size) {
-  enum gdb_gpr reg;
-  uint64_t val;
+  unsigned int reg;
+  unsigned long val;
 
   if(sscanf(data, "P%x=%lx", &reg, &val) != 2) {
-    return -1;
+    return gdb_pkt_puts(sess->fd, "");
+  }
+
+  if(reg >= GDB_GPR_MAX) {
+    // gdb may poke registers that are not part of our target description
+    // (e.g. orig_rax); accept such writes silently.
+    return gdb_pkt_puts(sess->fd, "OK");
   }
 
   if(reg <= GDB_GPR_RIP) {
@@ -624,13 +765,12 @@ gdb_response_setreg(gdb_session_t* sess, const char* data, size_t size) {
     val = __builtin_bswap32(val);
   }
 
-  if(gdb_setreg(sess->pid, reg, val)) {
-    return gdb_pkt_perror(sess->fd, "gdb_getreg");
+  if(gdb_setreg(sess->pid, (enum gdb_gpr)reg, val)) {
+    return gdb_pkt_perror(sess->fd, "gdb_setreg");
   }
 
   return gdb_pkt_puts(sess->fd, "OK");
 }
-
 
 
 
@@ -644,15 +784,15 @@ gdb_response_setreg(gdb_session_t* sess, const char* data, size_t size) {
  * and the query packet will be simplified as 'qAttached'.
  *
  * This query is used, for example, to know whether the remote process should be
- * detached or killed when a GDB session is ended with the quit command.
+ * detached or killed when a gdb session is ended with the quit command.
  *
  * Reply:
-    '1' - The remote server attached to an existing process.
-    '0' - The remote server created a new process.
-**/
+     '1' - The remote server attached to an existing process.
+     '0' - The remote server created a new process.
+ **/
 static int
 gdb_response_attached(gdb_session_t* sess, const char* data, size_t size) {
-  return gdb_pkt_printf(sess->fd, "%d", sess->pid > 0);
+  return gdb_pkt_printf(sess->fd, "%d", sess->attached && (sess->pid > 0));
 }
 
 
@@ -770,13 +910,14 @@ gdb_response_step(gdb_session_t* sess, const char* data, size_t size) {
   char buf[32];
   int sig = 0;
 
-  if(sscanf(data, "S%x;%lx", &sig, &addr) != 2) {
-    if(sscanf(data, "S%x", &sig) != 1) {
-      sscanf(data, "s%lx", &addr);
-    }
-  }
-
+  gdb_parse_stepcont(data, &addr, &sig);
   sig = gdb_sig_toposix(sig);
+
+  // Never re-inject the signals that typically cause a stop; step
+  // without a signal instead.
+  if(SIGSTOP == sig || SIGTRAP == sig) {
+    sig = 0;
+  }
 
   if(gdb_step(sess->pid, addr, sig)) {
     return gdb_pkt_perror(sess->fd, "gdb_step");
@@ -806,21 +947,28 @@ gdb_response_step(gdb_session_t* sess, const char* data, size_t size) {
  **/
 static int
 gdb_response_attach(gdb_session_t* sess, const char* data, size_t size) {
+  unsigned int upid;
   char buf[32];
   pid_t pid;
 
-  if(sscanf(data, "vAttach;%x", &pid) != 1) {
-    return -1;
+  if(sscanf(data, "vAttach;%x", &upid) != 1) {
+    return gdb_pkt_puts(sess->fd, "");
   }
 
+  pid = (pid_t)upid;
   if(gdb_attach(pid)) {
     return gdb_pkt_perror(sess->fd, "gdb_attach");
   }
 
   sess->pid = pid;
+  sess->attached = 1;
+  sess->sig = SIGTRAP;
+  sess->code = 0;
   sess->stdio = -1;
 
   if(gdb_waitpid(sess, buf, sizeof(buf))) {
+    sess->pid = -1;
+    sess->attached = 0;
     return gdb_pkt_perror(sess->fd, "gdb_waitpid");
   }
 
@@ -860,30 +1008,41 @@ static int
 gdb_response_fsopen(gdb_session_t* sess, const char* data, size_t size) {
   char filename[PATH_MAX];
   char buf[PATH_MAX*2];
+  const char* p;
   char *tok;
-  int flags;
-  int mode;
+  unsigned int flags;
+  unsigned int mode;
   int fd;
 
-  data += 11;
-  strcpy(buf, data);
+  if(strncmp(data, "vFile:open:", 11)) {
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
+  }
+  p = data + 11;
+
+  if(strlen(p) >= sizeof(buf)) {
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
+  }
+  strcpy(buf, p);
   if(!(tok=strstr(buf, ","))) {
-    return -1;
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
   }
   *tok = 0;
 
   if(gdb_hex2bin(buf, filename, sizeof(filename))) {
-    return -1;
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
   }
   if(sscanf(tok+1, "%x,%x", &flags, &mode) != 2) {
-    return -1;
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
   }
 
-  if((fd=open(filename, flags | O_CREAT, mode)) < 0) {
-    return gdb_pkt_printf(sess->fd, "F-1,%x", errno);
+  // The protocol defines portable open flag values (O_CREAT=0x200,
+  // O_TRUNC=0x400, ...); these are identical to the BSD ones used by
+  // the PS4/PS5 firmware, so no translation is required here.
+  if((fd=open(filename, flags, mode)) < 0) {
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)errno);
   }
 
-  return gdb_pkt_printf(sess->fd, "F%x", fd);
+  return gdb_pkt_printf(sess->fd, "F%x", (unsigned int)fd);
 }
 
 
@@ -895,14 +1054,14 @@ gdb_response_fsopen(gdb_session_t* sess, const char* data, size_t size) {
  **/
 static int
 gdb_response_fsclose(gdb_session_t* sess, const char* data, size_t size) {
-  int fd;
+  unsigned int fd;
 
   if(sscanf(data, "vFile:close:%x", &fd) != 1) {
-    return -1;
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
   }
 
-  if(close(fd)) {
-    return gdb_pkt_printf(sess->fd, "F-1,%x", errno);
+  if(close((int)fd)) {
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)errno);
   } else {
     return gdb_pkt_puts(sess->fd, "F0");
   }
@@ -922,43 +1081,108 @@ static int
 gdb_response_fswrite(gdb_session_t* sess, const char* data, size_t size) {
   const char* tok;
   ssize_t len;
-  off_t off = 0;
+  unsigned long off = 0;
+  unsigned int fd;
   void* buf;
-  int fd;
   int r;
 
   if(sscanf(data, "vFile:pwrite:%x,%lx", &fd, &off) != 2) {
-    return -1;
-  }
-  if(lseek(fd, off, SEEK_SET) == -1) {
-    return gdb_pkt_printf(sess->fd, "F-1,%x", errno);
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
   }
 
   if(!(tok=strstr(data, ","))) {
-    return -1;
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
   }
   if(!(tok=strstr(tok+1, ","))) {
-    return -1;
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
   }
 
   tok += 1;
-  if((len=(size-(size_t)(tok-data))) < 0) {
-    return -1;
+  if((len=(ssize_t)(size-(size_t)(tok-data))) <= 0) {
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
   }
   if(!(buf=malloc(len))) {
-    return -1;
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)ENOMEM);
   }
 
   memcpy(buf, tok, len);
   len = gdb_bin_unescape(buf, len);
 
-  if((len=write(fd, buf, len)) == -1) {
-    r = gdb_pkt_printf(sess->fd, "F-1,%x", errno);
+  // Use pwrite() rather than lseek() + write(); the file descriptor may
+  // be shared with other vFile operations.
+  if((len=pwrite((int)fd, buf, len, (off_t)off)) == -1) {
+    r = gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)errno);
   } else {
-    r = gdb_pkt_printf(sess->fd, "F%x", len);
+    r = gdb_pkt_printf(sess->fd, "F%x", (unsigned int)len);
   }
 
   free(buf);
+
+  return r;
+}
+
+
+/**
+ * Input pattern: 'vFile:pread: fd, count, offset'
+ *
+ * Read data (up to count bytes) from the open file corresponding to fd to
+ * a buffer; start the read at offset from the start of the file.
+ *
+ * Reply:
+ *   'F<count>;<data>' - count is the number of bytes read (in hex, 0 at
+ *                       end of file), followed by the binary data.
+ *   'F-1,<errno>'     - on failure.
+ **/
+static int
+gdb_response_fsread(gdb_session_t* sess, const char* data, size_t size) {
+  char head[16];
+  unsigned long off = 0;
+  unsigned int count = 0;
+  unsigned int fd;
+  ssize_t len;
+  size_t head_len;
+  size_t total;
+  char* buf;
+  char* out;
+  int r;
+
+  if(sscanf(data, "vFile:pread:%x,%x,%lx", &fd, &count, &off) != 3) {
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)EINVAL);
+  }
+
+  // Keep the reply below the packet size we advertise; binary data is
+  // escaped on the wire (which may double its size), and there is room
+  // needed for the leading 'F<count>;' header.
+  if(count > (GDB_PKT_MAX_SIZE / 4)) {
+    count = GDB_PKT_MAX_SIZE / 4;
+  }
+
+  if(!(buf=malloc(count ? count : 1))) {
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)ENOMEM);
+  }
+
+  if((len=pread((int)fd, buf, count, (off_t)off)) < 0) {
+    free(buf);
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)errno);
+  }
+
+  // Reply format: 'F' <count in hex> ';' <binary data>. Escaping of the
+  // binary data is applied by gdb_pkt_put().
+  snprintf(head, sizeof(head), "F%x;", (unsigned int)len);
+  head_len = strlen(head);
+  total = head_len + (size_t)len;
+
+  if(!(out=malloc(total))) {
+    free(buf);
+    return gdb_pkt_printf(sess->fd, "F-1,%x", (unsigned int)ENOMEM);
+  }
+
+  memcpy(out, head, head_len);
+  memcpy(out + head_len, buf, len);
+
+  free(buf);
+  r = gdb_pkt_put(sess->fd, out, total);
+  free(out);
 
   return r;
 }
@@ -979,14 +1203,46 @@ gdb_response_fswrite(gdb_session_t* sess, const char* data, size_t size) {
  **/
 static int
 gdb_response_run(gdb_session_t* sess, const char* data, size_t size) {
+  char buf[PATH_MAX*2];
   char filename[PATH_MAX];
   char* argv[] = {filename, 0};
+  const char *field, *end;
+  size_t len;
   int fds[2];
 
-  data += 5;
-  if(gdb_hex2bin(data, filename, sizeof(filename))) {
-    return -1;
+  if(!(field=strchr(data, ';'))) {
+    return gdb_pkt_printf(sess->fd, "E%02X", (EINVAL & 0xff));
   }
+  field += 1;
+
+  // Only the first argument is the program file; the remaining ';'-separated
+  // fields are command line arguments. The ELF loader passes no arguments to
+  // the payload, so they are ignored here.
+  if(!(end=strchr(field, ';'))) {
+    end = field + strlen(field);
+  }
+  len = end - field;
+
+  if(!len) {
+    // Empty filename: reuse the program from the previous vRun, if any.
+    if(!sess->runfile[0]) {
+      return gdb_pkt_printf(sess->fd, "E%02X", (ENOENT & 0xff));
+    }
+    memcpy(filename, sess->runfile, sizeof(filename));
+  } else {
+    if(len >= sizeof(buf)) {
+      return gdb_pkt_printf(sess->fd, "E%02X", (EINVAL & 0xff));
+    }
+    memcpy(buf, field, len);
+    buf[len] = 0;
+    if(gdb_hex2bin(buf, filename, sizeof(filename))) {
+      return gdb_pkt_printf(sess->fd, "E%02X", (EINVAL & 0xff));
+    }
+    snprintf(sess->runfile, sizeof(sess->runfile), "%s", filename);
+  }
+
+  // Clean up any inferior left from a previous run.
+  gdb_halt_inferior(sess);
 
   if(pipe(fds) == -1) {
     return gdb_pkt_perror(sess->fd, "pipe");
@@ -1001,11 +1257,13 @@ gdb_response_run(gdb_session_t* sess, const char* data, size_t size) {
   if((sess->pid=gdb_spawn(argv, fds[1], &sess->baseaddr)) < 0) {
     close(fds[0]);
     close(fds[1]);
-    return gdb_pkt_printf(sess->fd, "X-1,%d", errno);
+    return gdb_pkt_perror(sess->fd, "gdb_spawn");
   }
 
   close(fds[1]);
+  sess->attached = 0;
   sess->sig = SIGSTOP;
+  sess->code = 0;
   sess->stdio = fds[0];
 
   printf("Attached to PID: %d, ELF: %s\n", sess->pid, filename);
@@ -1066,7 +1324,33 @@ gdb_response(void* ctx, const char* data, size_t size) {
     if(STR_START_WITH(data, "qXfer")) {
       return gdb_response_transfer(sess, data, size);
     }
+    // We expose the inferior as a single thread whose id is its pid.
+    // Without these replies gdb falls back to the obsolete 'qL' packet,
+    // which crashes some gdb versions (e.g. 17.x).
+    if(!strcmp(data, "qC")) {
+      if(sess->pid > 0) {
+	return gdb_pkt_printf(sess->fd, "QC%x", (unsigned int)sess->pid);
+      }
+      return gdb_pkt_puts(sess->fd, "");
+    }
+    if(!strcmp(data, "qfThreadInfo")) {
+      if(sess->pid > 0) {
+	return gdb_pkt_printf(sess->fd, "m%x", (unsigned int)sess->pid);
+      }
+      return gdb_pkt_puts(sess->fd, "l");
+    }
+    if(!strcmp(data, "qsThreadInfo")) {
+      return gdb_pkt_puts(sess->fd, "l");
+    }
     return gdb_pkt_puts(sess->fd, "");
+
+  case 'H':
+    // Set thread for subsequent operations; there is only one.
+    return gdb_pkt_puts(sess->fd, "OK");
+
+  case 'T':
+    // Thread alive query.
+    return gdb_pkt_puts(sess->fd, sess->pid > 0 ? "OK" : "E01");
 
   case 's':
   case 'S':
@@ -1088,10 +1372,15 @@ gdb_response(void* ctx, const char* data, size_t size) {
     if(STR_START_WITH(data, "vFile:pwrite")) {
       return gdb_response_fswrite(sess, data, size);
     }
+    if(STR_START_WITH(data, "vFile:pread")) {
+      return gdb_response_fsread(sess, data, size);
+    }
     if(STR_START_WITH(data, "vRun")) {
       return gdb_response_run(sess, data, size);
     }
 
+    // unknown v-packets are answered with an empty reply
+    /* fall through */
   default:
     return gdb_pkt_puts(sess->fd, "");
   }
@@ -1116,13 +1405,8 @@ gdb_response_session(int fd) {
     }
   }
 
-  if(sess.fd > 0) {
-    close(sess.fd);
-  }
-  if(sess.stdio > 0) {
-    close(sess.stdio);
-  }
-  if(sess.pid > 0) {
-    kill(sess.pid, SIGKILL);
-  }
+  // The socket itself is closed by the connection handler thread; releasing
+  // the interior (detaching attached processes, killing spawned ones) is
+  // done here.
+  gdb_halt_inferior(&sess);
 }

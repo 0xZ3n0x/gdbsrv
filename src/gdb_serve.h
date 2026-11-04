@@ -22,4 +22,4 @@ along with this program; see the file COPYING. If not, see
 /**
  * Serve gdb on the given port.
  **/
-void gdb_serve(uint16_t port);
+int gdb_serve(uint16_t port);
