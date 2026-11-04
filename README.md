@@ -1,31 +1,17 @@
 # gdbsrv
-This is a simple GDB server that can be executed on a Playstation 4 or
-Playstation 5 that has been jailbroken and is running an ELF loader.
-The server accepts connections on port 2159, and has been tested with
-gdb-15.
+This is a simple GDB server that can be executed on a Playstation 5 that has
+been jailbroken and is running an ELF loader. The server accepts connections on
+port 2159, and has been tested with gdb-15 and gdb-17.
 
-## Building for the PS4
-Assuming you have the [ps4-payload-sdk][sdk-ps4] installed on a POSIX machine,
-the GDB server can be compiled using the following two commands:
-```console
-john@localhost:gdbsrv$ export PS4_PAYLOAD_SDK=/opt/ps4-payload-sdk
-john@localhost:gdbsrv$ make -f Makefile.ps4
-```
-
-## Building for the PS5
+## Building
 Assuming you have the [ps5-payload-sdk][sdk-ps5] installed on a POSIX machine,
 the GDB server can be compiled using the following two commands:
 ```console
 john@localhost:gdbsrv$ export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 john@localhost:gdbsrv$ make -f Makefile.ps5
 ```
-
-## Building for GNU/Linux systems
-Assuming you have a compiler toolchain installed on your GNU/Linux system,
-the GDB server can be compiled using the following command:
-```console
-john@localhost:gdbsrv$ make -f Makefile.posix
-```
+The payload is written to `build/gdbsrv-ps5.elf`; send it to the ELF loader of
+your PS5, e.g. `nc --send-only ps5 9021 < build/gdbsrv-ps5.elf`.
 
 ## Symbols for sony libraries
 gdbsrv reports the loaded sony libraries to gdb, and builds a symbol file for
@@ -52,6 +38,5 @@ to discuss the solution properly before you commit time and effort.
 ## License
 gdbsrv is licensed under the GPLv3+.
 
-[sdk-ps4]: https://github.com/ps4-payload-dev/sdk
 [sdk-ps5]: https://github.com/ps5-payload-dev/sdk
 [issues]: https://github.com/ps5-payload-dev/shsrv/issues/new
